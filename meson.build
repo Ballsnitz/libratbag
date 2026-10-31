@@ -338,10 +338,16 @@ if enable_tests
 						 dep_libutil],
 				include_directories : include_directories('src'),
 				install : false)
+	test_driver_hidpp20 = executable('test-driver-hidpp20',
+				['test/test-driver-hidpp20.c'],
+				dependencies : [ dep_libratbag, dep_check ],
+				include_directories : include_directories('src'),
+				install : false)
 	test('test-context', test_context)
 	test('test-device', test_device)
 	test('test-util', test_util)
 	test('test-iconv-helper', test_iconv_helper)
+	test('test-driver-hidpp20', test_driver_hidpp20)
 
 	valgrind = find_program('valgrind', required : false)
 	if valgrind.found()

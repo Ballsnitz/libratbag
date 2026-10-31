@@ -1187,6 +1187,72 @@ hidpp20drv_read_leds(struct ratbag_device *device)
 	return rc;
 }
 
+/**
+ * Decode the raw UTF-16LE name of an onboard profile into a newly
+ * allocated UTF-8 string. The on-device field is padded with 0x0000 or
+ * 0xffff code units, whichever the firmware/configuration software used.
+ *
+ * Returns NULL if the profile has no (valid) name.
+ */
+static char *
+hidpp20drv_read_profile_name_8100(struct ratbag_device *device,
+				  struct hidpp20_profile *h_profile)
+{
+	const uint8_t *raw = (const uint8_t *)h_profile->name;
+	char *name = NULL;
+	size_t len = 0;
+	ssize_t rc;
+
+	while (len + 1 < sizeof(h_profile->name)) {
+		uint16_t unit = raw[len] | (raw[len + 1] << 8);
+
+		if (unit == 0x0000 || unit == 0xffff)
+			break;
+		len += 2;
+	}
+
+	if (len == 0)
+		return NULL;
+
+	rc = ratbag_utf8_from_enc(h_profile->name, len, "UTF-16LE", &name);
+	if (rc < 0) {
+		log_debug(device->ratbag,
+			  "hidpp20: ignoring undecodable onboard profile name (%zd)\n",
+			  rc);
+		return NULL;
+	}
+
+	return name;
+}
+
+/**
+ * Encode the profile's UTF-8 name into the raw UTF-16LE onboard profile
+ * name field. Names longer than the field are truncated, the field is
+ * padded with 0x0000.
+ *
+ * Returns 0 on success or a negative errno.
+ */
+static int
+hidpp20drv_update_profile_name_8100(struct ratbag_device *device,
+				    struct ratbag_profile *profile,
+				    struct hidpp20_profile *h_profile)
+{
+	ssize_t rc;
+
+	rc = ratbag_utf8_to_enc(h_profile->name, sizeof(h_profile->name),
+				"UTF-16LE", "%s", profile->name);
+	/* E2BIG: the name doesn't fit, EINVAL: the input was cut mid-sequence
+	 * while being fitted. Both leave a valid, zero-padded prefix behind. */
+	if (rc == -E2BIG || rc == -EINVAL) {
+		log_info(device->ratbag,
+			 "hidpp20: profile %u name '%s' is too long, truncating\n",
+			 profile->index, profile->name);
+		rc = 0;
+	}
+
+	return rc < 0 ? (int)rc : 0;
+}
+
 static void
 hidpp20drv_read_profile_8100(struct ratbag_profile *profile)
 {
@@ -1208,6 +1274,18 @@ hidpp20drv_read_profile_8100(struct ratbag_profile *profile)
 		dpi_index = 0xff;
 
 	p = &drv_data->profiles->profiles[profile->index];
+
+	/* The onboard profile format always carries a name, so the name is
+	 * writable on every 0x8100 device. A profile that was never named
+	 * has no name to show; expose a default name in that case so the
+	 * name can still be set (a NULL name means the device does not
+	 * support profile names at all, an empty one is treated as
+	 * read-only by ratbagd clients). This mirrors the HID++ 1.0
+	 * driver's fallback. */
+	free(profile->name);
+	profile->name = hidpp20drv_read_profile_name_8100(device, p);
+	if (!profile->name)
+		profile->name = asprintf_safe("Profile %u", profile->index + 1);
 
 	ratbag_profile_for_each_resolution(profile, res) {
 		struct hidpp20_sensor *sensor;
@@ -1529,8 +1607,27 @@ hidpp20drv_commit(struct ratbag_device *device)
 	}
 
 	if (drv_data->capabilities & HIDPP_CAP_ONBOARD_PROFILES_8100) {
-		list_for_each(profile, &device->profiles, link)
-			drv_data->profiles->profiles[profile->index].enabled = profile->is_enabled;
+		list_for_each(profile, &device->profiles, link) {
+			struct hidpp20_profile *h_profile;
+
+			h_profile = &drv_data->profiles->profiles[profile->index];
+			h_profile->enabled = profile->is_enabled;
+
+			/* Only re-encode the name of profiles that changed, so
+			 * untouched profiles keep their exact on-device name
+			 * bytes. Like the HID++ 1.0 driver, a changed profile
+			 * gets its current name written back, including a
+			 * made-up default one. */
+			if (!profile->dirty || !profile->name)
+				continue;
+
+			rc = hidpp20drv_update_profile_name_8100(device, profile,
+								 h_profile);
+			if (rc) {
+				log_error(device->ratbag, "hidpp20: failed to update profile name (%d)\n", rc);
+				return RATBAG_ERROR_DEVICE;
+			}
+		}
 
 		rc = hidpp20_onboard_profiles_commit(drv_data->dev,
 						     drv_data->profiles);

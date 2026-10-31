@@ -877,6 +877,9 @@ _Static_assert(sizeof(union hidpp20_macro_data) == 3, "Invalid size");
 struct hidpp20_profile {
 	uint16_t address;
 	uint8_t enabled;
+	/* Raw on-device profile name: UTF-16LE, up to 24 code units, padded
+	 * with 0x0000 or 0xffff. Not NUL-terminated, do not treat as a C
+	 * string. An all-0xff field means the profile was never named. */
 	char name[16 * 3];
 	uint16_t powersave_timeout;
 	uint16_t poweroff_timeout;

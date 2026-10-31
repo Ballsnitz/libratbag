@@ -2762,11 +2762,10 @@ hidpp20_onboard_profiles_parse_profile(struct hidpp20_device *device,
 
 	hidpp20_buttons_to_cpu(device, profiles_list, profile, pdata->profile.buttons, profiles_list->num_buttons);
 
+	/* The name is kept as the raw UTF-16LE field, decoding is up to the
+	 * caller. A never-named profile has the field set to all 0xff, zero
+	 * it so callers only have to deal with one "no name" representation. */
 	memcpy(profile->name, pdata->profile.name.txt, sizeof(profile->name));
-	/* force terminating '\0' */
-	profile->name[sizeof(profile->name) - 1] = '\0';
-
-	/* check if we are using the default name or not */
 	for (i = 0; i < sizeof(profile->name); i++) {
 		if (pdata->profile.name.raw[i] != 0xff)
 			break;
