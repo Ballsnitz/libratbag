@@ -803,6 +803,11 @@ class RatbagdMacro(metaclass=MetaRatbag):
         idx = 0
         while idx < len(self._macro):
             t, v = self._macro[idx]
+            # get_num_events() reports the capacity, and the unused tail is
+            # RATBAG_MACRO_EVENT_NONE (0). That is the end of the macro, not
+            # an event we can format.
+            if t == RatbagdButton.Macro.NONE:
+                break
             try:
                 if t == RatbagdButton.Macro.KEY_PRESS:
                     # Check for a paired press/release event
@@ -834,6 +839,11 @@ class RatbagdMacro(metaclass=MetaRatbag):
 
         for i in range(libratbag.ratbag_button_macro_get_num_events(macro_object)):
             type = libratbag.ratbag_button_macro_get_event_type(macro_object, i)
+            if (
+                type == RatbagdButton.Macro.NONE
+                or type == libratbag.RATBAG_MACRO_EVENT_INVALID
+            ):
+                break
             value = None
             if type == RatbagdButton.Macro.WAIT:
                 value = libratbag.ratbag_button_macro_get_event_timeout(macro_object, i)

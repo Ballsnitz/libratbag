@@ -98,7 +98,8 @@ ascii_to_raw_name(uint8_t raw[NAME_FIELD_SIZE], const char *ascii)
  */
 static struct ratbag_device *
 hidpp20_8100_device_new(struct ratbag *ratbag,
-			const char *names[TEST_NUM_PROFILES])
+			const char *names[TEST_NUM_PROFILES],
+			unsigned int num_buttons)
 {
 	struct input_id id = { 0 };
 	struct ratbag_device *device;
@@ -154,11 +155,12 @@ hidpp20_8100_device_new(struct ratbag *ratbag,
 		if (names[i])
 			ascii_to_raw_name((uint8_t *)p->name, names[i]);
 	}
+	profiles->num_buttons = num_buttons;
 	drv_data->profiles = profiles;
 
 	drv_data->num_profiles = TEST_NUM_PROFILES;
 	drv_data->num_resolutions = TEST_NUM_RESOLUTIONS;
-	drv_data->num_buttons = 0;
+	drv_data->num_buttons = num_buttons;
 	drv_data->num_leds = 0;
 
 	/* same as hidpp20drv_init_device() */
@@ -210,7 +212,7 @@ START_TEST(hidpp20_8100_profile_name_read)
 	struct ratbag_device *d;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 
 	assert_profile_name(d, 0, "banana");
 	assert_profile_name(d, 2, "kiwi");
@@ -229,7 +231,7 @@ START_TEST(hidpp20_8100_profile_name_read_utf16)
 	unsigned int i;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 
 	/* "Zoë", padded with 0xffff the way Logitech's software leaves the
 	 * unused part of the field */
@@ -277,7 +279,7 @@ START_TEST(hidpp20_8100_profile_name_default)
 	unsigned int i;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 
 	/* Every 0x8100 profile carries a name field, so the name is always
 	 * writable. A profile that was never named must not end up with a
@@ -311,7 +313,7 @@ START_TEST(hidpp20_8100_profile_name_set)
 	int rc;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 
 	/* a profile with a name stored on the device */
 	p = ratbag_device_get_profile(d, 0);
@@ -346,7 +348,7 @@ START_TEST(hidpp20_8100_profile_name_commit)
 	int rc;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 	drv_data = ratbag_get_drv_data(d);
 
 	p = ratbag_device_get_profile(d, 0);
@@ -391,7 +393,7 @@ START_TEST(hidpp20_8100_profile_name_commit_utf16)
 	int rc;
 
 	r = ratbag_create_context(&abort_iface, NULL);
-	d = hidpp20_8100_device_new(r, names);
+	d = hidpp20_8100_device_new(r, names, 0);
 	drv_data = ratbag_get_drv_data(d);
 
 	/* non-ASCII name */
@@ -436,6 +438,170 @@ START_TEST(hidpp20_8100_profile_name_commit_utf16)
 }
 END_TEST
 
+static struct ratbag_button *
+button_of(struct ratbag_device *device, unsigned int index)
+{
+	struct ratbag_profile *profile;
+	struct ratbag_button *button;
+
+	profile = ratbag_device_get_profile(device, 0);
+	button = ratbag_profile_get_button(profile, index);
+	ratbag_profile_unref(profile);
+	ck_assert_ptr_nonnull(button);
+	return button;
+}
+
+/**
+ * A chord: every key pressed, then released in reverse order. nkeys is the
+ * number of keys held together, not the number of events.
+ */
+static void
+set_chord(struct ratbag_button *button, const unsigned int *keys,
+	  unsigned int nkeys)
+{
+	struct ratbag_button_macro *macro;
+	unsigned int i;
+	int rc;
+
+	macro = ratbag_button_macro_new("test");
+	for (i = 0; i < nkeys; i++) {
+		rc = ratbag_button_macro_set_event(macro, i,
+						   RATBAG_MACRO_EVENT_KEY_PRESSED,
+						   keys[i]);
+		ck_assert_int_eq(rc, RATBAG_SUCCESS);
+	}
+	for (i = 0; i < nkeys; i++) {
+		rc = ratbag_button_macro_set_event(macro, nkeys + i,
+						   RATBAG_MACRO_EVENT_KEY_RELEASED,
+						   keys[nkeys - 1 - i]);
+		ck_assert_int_eq(rc, RATBAG_SUCCESS);
+	}
+	rc = ratbag_button_set_macro(button, macro);
+	ck_assert_int_eq(rc, RATBAG_SUCCESS);
+	ratbag_button_macro_unref(macro);
+}
+
+static void
+assert_binding(struct ratbag_device *device, unsigned int index,
+	       const uint8_t expected[4])
+{
+	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
+	uint8_t raw[4];
+
+	memcpy(raw, &drv_data->profiles->profiles[0].buttons[index], sizeof(raw));
+	ck_assert_mem_eq(raw, expected, sizeof(raw));
+}
+
+/**
+ * https://github.com/libratbag/libratbag/issues/1898
+ * Disabling a button must store a HID binding with the NOOP subtype.
+ * Writing the NOOP value into the type byte instead stores a macro
+ * (type 0x00), which the reader cannot parse.
+ */
+START_TEST(hidpp20_8100_disable_button)
+{
+	const char *names[TEST_NUM_PROFILES] = { NULL, NULL, NULL };
+	const uint8_t expected[4] = {
+		HIDPP20_BUTTON_HID_TYPE, HIDPP20_BUTTON_HID_TYPE_NOOP, 0xff, 0xff
+	};
+	struct ratbag *r;
+	struct ratbag_device *d;
+	struct hidpp20drv_data *drv_data;
+	struct ratbag_button *button;
+	int rc;
+
+	r = ratbag_create_context(&abort_iface, NULL);
+	d = hidpp20_8100_device_new(r, names, 1);
+	drv_data = ratbag_get_drv_data(d);
+
+	/* a keyboard binding (Ctrl+Y, as reported in the issue) so the
+	 * leftover bytes would survive a type-only update */
+	drv_data->profiles->profiles[0].buttons[0].keyboard_keys.type = HIDPP20_BUTTON_HID_TYPE;
+	drv_data->profiles->profiles[0].buttons[0].keyboard_keys.subtype = HIDPP20_BUTTON_HID_TYPE_KEYBOARD;
+	drv_data->profiles->profiles[0].buttons[0].keyboard_keys.modifier_flags = 0x01;
+	drv_data->profiles->profiles[0].buttons[0].keyboard_keys.key = 0x1c;
+
+	button = button_of(d, 0);
+	rc = ratbag_button_disable(button);
+	ck_assert_int_eq(rc, RATBAG_SUCCESS);
+	rc = hidpp20drv_update_button(button);
+	ck_assert_int_eq(rc, 0);
+	assert_binding(d, 0, expected);
+
+	/* the reader and the writer must agree: it comes back disabled,
+	 * not as a macro */
+	hidpp20drv_read_button(button);
+	ck_assert_int_eq(button->action.type, RATBAG_BUTTON_ACTION_TYPE_NONE);
+	ratbag_button_unref(button);
+
+	ratbag_device_unref(d);
+	ratbag_unref(r);
+}
+END_TEST
+
+/**
+ * https://github.com/libratbag/libratbag/issues/1906
+ * A modifier-only macro is a real binding (G HUB stores Left Ctrl as
+ * 80 02 01 00) and must be written. A plain key still takes the existing
+ * keyboard path.
+ */
+START_TEST(hidpp20_8100_modifier_only_macro)
+{
+	const char *names[TEST_NUM_PROFILES] = { NULL, NULL, NULL };
+	const unsigned int ctrl[] = { KEY_LEFTCTRL };
+	const unsigned int ctrl_reserved[] = { KEY_LEFTCTRL, KEY_RESERVED };
+	const unsigned int ctrl_shift[] = { KEY_LEFTCTRL, KEY_LEFTSHIFT };
+	const unsigned int ctrl_y[] = { KEY_LEFTCTRL, KEY_Y };
+	const uint8_t left_ctrl[4] = {
+		HIDPP20_BUTTON_HID_TYPE, HIDPP20_BUTTON_HID_TYPE_KEYBOARD, 0x01, 0x00
+	};
+	const uint8_t ctrl_and_shift[4] = {
+		HIDPP20_BUTTON_HID_TYPE, HIDPP20_BUTTON_HID_TYPE_KEYBOARD, 0x03, 0x00
+	};
+	uint8_t ctrl_and_y[4];
+	struct ratbag *r;
+	struct ratbag_device *d;
+	struct ratbag_button *button;
+	int rc;
+
+	r = ratbag_create_context(&abort_iface, NULL);
+	d = hidpp20_8100_device_new(r, names, 1);
+
+	button = button_of(d, 0);
+
+	set_chord(button, ctrl, ARRAY_LENGTH(ctrl));
+	rc = hidpp20drv_update_button(button);
+	ck_assert_int_eq(rc, 0);
+	assert_binding(d, 0, left_ctrl);
+
+	/* the form libratbag itself reports for a modifier-only button */
+	set_chord(button, ctrl_reserved, ARRAY_LENGTH(ctrl_reserved));
+	rc = hidpp20drv_update_button(button);
+	ck_assert_int_eq(rc, 0);
+	assert_binding(d, 0, left_ctrl);
+
+	set_chord(button, ctrl_shift, ARRAY_LENGTH(ctrl_shift));
+	rc = hidpp20drv_update_button(button);
+	ck_assert_int_eq(rc, 0);
+	assert_binding(d, 0, ctrl_and_shift);
+
+	/* a modifier plus a real key keeps the existing encoding */
+	set_chord(button, ctrl_y, ARRAY_LENGTH(ctrl_y));
+	rc = hidpp20drv_update_button(button);
+	ck_assert_int_eq(rc, 0);
+	ctrl_and_y[0] = HIDPP20_BUTTON_HID_TYPE;
+	ctrl_and_y[1] = HIDPP20_BUTTON_HID_TYPE_KEYBOARD;
+	ctrl_and_y[2] = 0x01;
+	ctrl_and_y[3] = ratbag_hidraw_get_keyboard_usage_from_keycode(d, KEY_Y);
+	ck_assert_int_ne(ctrl_and_y[3], 0);
+	assert_binding(d, 0, ctrl_and_y);
+
+	ratbag_button_unref(button);
+	ratbag_device_unref(d);
+	ratbag_unref(r);
+}
+END_TEST
+
 static Suite *
 test_driver_hidpp20_suite(void)
 {
@@ -450,6 +616,8 @@ test_driver_hidpp20_suite(void)
 	tcase_add_test(tc, hidpp20_8100_profile_name_set);
 	tcase_add_test(tc, hidpp20_8100_profile_name_commit);
 	tcase_add_test(tc, hidpp20_8100_profile_name_commit_utf16);
+	tcase_add_test(tc, hidpp20_8100_disable_button);
+	tcase_add_test(tc, hidpp20_8100_modifier_only_macro);
 	suite_add_tcase(s, tc);
 
 	return s;

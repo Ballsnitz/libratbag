@@ -523,6 +523,63 @@ hidpp20drv_update_button_1b04(struct ratbag_button *button)
 	return rc;
 }
 
+/**
+ * A macro that holds one or more modifiers and no other key. G HUB stores
+ * that as a keyboard binding with the modifier flags set and a key usage of
+ * 0, rather than as an onboard macro. Returns 0 and the combined modifier
+ * flags, or -EINVAL when the macro is anything else.
+ */
+static int
+hidpp20drv_modifier_only_flags(const struct ratbag_button_action *action,
+			       unsigned int *flags_out)
+{
+	const struct ratbag_macro *macro = action->macro;
+	unsigned int flags = 0;
+	bool pressed = false;
+	unsigned int i;
+
+	if (!macro)
+		return -EINVAL;
+
+	for (i = 0; i < MAX_MACRO_EVENTS; i++) {
+		struct ratbag_macro_event event = macro->events[i];
+
+		if (event.type == RATBAG_MACRO_EVENT_NONE)
+			break;
+		if (event.type != RATBAG_MACRO_EVENT_KEY_PRESSED &&
+		    event.type != RATBAG_MACRO_EVENT_KEY_RELEASED)
+			return -EINVAL;
+		/* libratbag reports a modifier-only button as the modifier
+		 * around a KEY_RESERVED press/release */
+		if (event.event.key == KEY_RESERVED)
+			continue;
+		if (!ratbag_key_is_modifier(event.event.key))
+			return -EINVAL;
+		if (event.type != RATBAG_MACRO_EVENT_KEY_PRESSED)
+			continue;
+
+		pressed = true;
+		switch (event.event.key) {
+		case KEY_LEFTCTRL: flags |= MODIFIER_LEFTCTRL; break;
+		case KEY_LEFTSHIFT: flags |= MODIFIER_LEFTSHIFT; break;
+		case KEY_LEFTALT: flags |= MODIFIER_LEFTALT; break;
+		case KEY_LEFTMETA: flags |= MODIFIER_LEFTMETA; break;
+		case KEY_RIGHTCTRL: flags |= MODIFIER_RIGHTCTRL; break;
+		case KEY_RIGHTSHIFT: flags |= MODIFIER_RIGHTSHIFT; break;
+		case KEY_RIGHTALT: flags |= MODIFIER_RIGHTALT; break;
+		case KEY_RIGHTMETA: flags |= MODIFIER_RIGHTMETA; break;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	if (!pressed)
+		return -EINVAL;
+
+	*flags_out = flags;
+	return 0;
+}
+
 static int
 hidpp20drv_update_button_8100(struct ratbag_button *button)
 {
@@ -548,13 +605,32 @@ hidpp20drv_update_button_8100(struct ratbag_button *button)
 	case RATBAG_BUTTON_ACTION_TYPE_MACRO:
 		type = HIDPP20_BUTTON_HID_TYPE;
 		subtype = HIDPP20_BUTTON_HID_TYPE_KEYBOARD;
+		modifiers = 0;
+		key = KEY_RESERVED;
 		rc = ratbag_action_keycode_from_macro(action,
 						      &key,
 						      &modifiers);
 		if (rc < 0) {
-			log_error(device->ratbag,
-				  "Error while writing macro for button %d\n",
-				  button->index);
+			/* a lone modifier is not a single key code, but the
+			 * device stores it as a keyboard binding with no key */
+			rc = hidpp20drv_modifier_only_flags(action, &modifiers);
+			if (rc < 0) {
+				log_error(device->ratbag,
+					  "Error while writing macro for button %d\n",
+					  button->index);
+				return -EINVAL;
+			}
+			key = KEY_RESERVED;
+		}
+
+		if (key == KEY_RESERVED) {
+			if (!modifiers)
+				return -EINVAL;
+			profile->buttons[button->index].keyboard_keys.type = type;
+			profile->buttons[button->index].keyboard_keys.subtype = subtype;
+			profile->buttons[button->index].keyboard_keys.modifier_flags = modifiers;
+			profile->buttons[button->index].keyboard_keys.key = 0;
+			break;
 		}
 
 		code = ratbag_hidraw_get_keyboard_usage_from_keycode(device, key);
@@ -600,7 +676,15 @@ hidpp20drv_update_button_8100(struct ratbag_button *button)
 		profile->buttons[button->index].special.special = code;
 		break;
 	case RATBAG_BUTTON_ACTION_TYPE_NONE:
-		profile->buttons[button->index].disabled.type = HIDPP20_BUTTON_HID_TYPE_NOOP;
+		/* NOOP is a subtype of the HID type. The type byte itself
+		 * must stay HIDPP20_BUTTON_HID_TYPE: 0x00 is HIDPP20_BUTTON_MACRO,
+		 * so writing the subtype value there stores a macro whose
+		 * page and offset are whatever bytes the binding still holds.
+		 * https://github.com/libratbag/libratbag/issues/1898 */
+		memset(&profile->buttons[button->index], 0xff,
+		       sizeof(profile->buttons[button->index]));
+		profile->buttons[button->index].subany.type = HIDPP20_BUTTON_HID_TYPE;
+		profile->buttons[button->index].subany.subtype = HIDPP20_BUTTON_HID_TYPE_NOOP;
 		break;
 	default:
 		return -ENOTSUP;
